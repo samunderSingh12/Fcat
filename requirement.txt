@@ -1,0 +1,4 @@
+fzf latest
+bat or batcat
+fd
+zoxide or z 
