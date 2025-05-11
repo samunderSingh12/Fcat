@@ -4,6 +4,11 @@
 
 Say goodbye to typing long paths and `ls | grep` chains!
 
+## DEMO
+[Watch the Full video here](fcat.mp4)
+
+![Demo GIF](fcat.gif)
+
 ## Motivation
 
 Navigating and viewing files from the terminal can be cumbersome:
