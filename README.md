@@ -102,3 +102,22 @@ The basic syntax is:
 
 ```bash
 fcat [directory_hint_part_1 directory_hint_part_2 ...] [filename_query]
+```
+## ignore file
+Fcat can ignore specified files and folders during scanning, which will significantly improve speed.
+
+```bash
+Location: fcat will look for an ignore file at ~/.config/fcat/fcat.ignore
+```
+Example fcat.ignore content:
+
+```bash
+node_modules
+.cache
+build
+dist
+output
+target
+*.log
+temp/
+```
