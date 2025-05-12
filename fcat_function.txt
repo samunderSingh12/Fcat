@@ -3,13 +3,15 @@ fcat() {
   local filename_query=""
   local dir_hint_string=""
   local search_paths_array=()
-  local resolved_search_dir_single="" # For a single resolved directory
+  local resolved_search_dir_single=""
   local BAT_EXECUTABLE=""
   local FD_EXECUTABLE=""
   local PREVIEW_COMMAND=""
   local OPEN_COMMAND=""
   local last_arg_idx
   local ec=0
+  local ignore_file="${XDG_CONFIG_HOME:-$HOME/.config}/fcat/fcat.ignore"
+  local ignore_patterns_for_fd=()
 
   # --- Dependency Detection & Command Setup ---
   if command -v bat &>/dev/null; then
@@ -28,20 +30,33 @@ fcat() {
     echo "fcat error: fzf is not installed. Please install it to use fcat." >&2
     return 1
   fi
-  # Note: zoxide check is done later, only if needed and hint is provided.
 
   if [[ -n "$BAT_EXECUTABLE" ]]; then
     PREVIEW_COMMAND="$BAT_EXECUTABLE --color=always --style=numbers --line-range :200 --paging=never {}"
     OPEN_COMMAND="$BAT_EXECUTABLE"
   else
-    if [[ $# -gt 0 ]]; then # Only warn if actually trying to process arguments
+    if [[ $# -gt 0 ]]; then
         echo "fcat info: 'bat' or 'batcat' not found. Using basic preview and 'cat' for opening." >&2
     fi
     PREVIEW_COMMAND="head -n 50 {}"
     OPEN_COMMAND="cat"
   fi
 
-  # --- Argument Parsing ---
+  # --- Read Ignore Patterns (for fd) ---
+  if [[ -f "$ignore_file" && -n "$FD_EXECUTABLE" ]]; then
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}" # Remove comments
+        line="${line%"${line##*[![:space:]]}"}" # Trim trailing whitespace
+        line="${line#"${line%%[![:space:]]*}"}"  # Trim leading whitespace
+        if [[ -n "$line" ]]; then
+            ignore_patterns_for_fd+=("--exclude")
+            ignore_patterns_for_fd+=("$line")
+        fi
+    done < "$ignore_file"
+  fi
+
+  # --- Argument Parsing & Directory Resolution ---
   if [[ $# -eq 0 ]]; then
     search_paths_array=("." "~")
     echo "fcat: Searching files in current directory (.) and home (~)..." >&2
@@ -51,27 +66,24 @@ fcat() {
     echo "fcat: Searching for '$filename_query' in current directory (.) and home (~)..." >&2
   else # Two or more arguments
     last_arg_idx=$(( $# - 1 ))
-    filename_query="${!#}" # More portable way to get last argument
+    filename_query="${!#}"
 
-    local dir_hint_parts_temp=("${@}") # Copy all arguments
-    unset 'dir_hint_parts_temp[last_arg_idx]' # Unset the last element
-    local dir_hint_parts=("${dir_hint_parts_temp[@]}") # Rebuild array
+    local dir_hint_parts_temp=("${@}")
+    unset 'dir_hint_parts_temp[last_arg_idx]'
+    local dir_hint_parts=("${dir_hint_parts_temp[@]}")
 
     if [[ ${#dir_hint_parts[@]} -gt 0 ]]; then
       dir_hint_string=$(printf "%s " "${dir_hint_parts[@]}")
-      dir_hint_string="${dir_hint_string% }" # Remove trailing space
+      dir_hint_string="${dir_hint_string% }"
     fi
 
-    # --- Directory Resolution Stages ---
-    # Stage 1: Direct path resolution
     if [[ -n "$dir_hint_string" && -d "$dir_hint_string" ]]; then
         resolved_search_dir_single=$(realpath "$dir_hint_string" 2>/dev/null)
-        if [[ ! -d "$resolved_search_dir_single" ]]; then # realpath might fail or return non-dir
+        if [[ ! -d "$resolved_search_dir_single" ]]; then
             resolved_search_dir_single=""
         fi
     fi
 
-    # Stage 2: Single zoxide non-interactive query resolution
     if [[ -z "$resolved_search_dir_single" && -n "$dir_hint_string" && -x "$(command -v zoxide)" ]]; then
       local z_path_single_auto
       z_path_single_auto=$(zoxide query "$dir_hint_string" 2>/dev/null)
@@ -80,11 +92,9 @@ fcat() {
       fi
     fi
 
-    # Stage 3: Zoxide INTERACTIVE query resolution
     if [[ -z "$resolved_search_dir_single" && -n "$dir_hint_string" && -x "$(command -v zoxide)" ]]; then
       echo "fcat: Hint \"$dir_hint_string\" not directly resolved. Trying interactive zoxide selection..." >&2
       local z_path_interactive
-      # stderr from zoxide -i will go to terminal, which is fine for user interaction
       z_path_interactive=$(zoxide query -i "$dir_hint_string")
       if [[ $? -eq 0 && -n "$z_path_interactive" && -d "$z_path_interactive" ]]; then
         resolved_search_dir_single="$z_path_interactive"
@@ -94,49 +104,55 @@ fcat() {
       fi
     fi
 
-    # Determine final search_paths_array
     if [[ -n "$resolved_search_dir_single" ]]; then
       search_paths_array=("$resolved_search_dir_single")
-      # Message already printed by the stage that resolved it.
-    else # Stage 4: Full Fallback
-      if [[ -n "$dir_hint_string" ]]; then # Only warn if a hint was given but couldn't be resolved
+    else
+      if [[ -n "$dir_hint_string" ]]; then
         echo "fcat warning: Directory hint \"$dir_hint_string\" could not be resolved by any method." >&2
       fi
       echo "fcat: Falling back to search for '$filename_query' (with hint \"$dir_hint_string\") in current directory (.) and home (~)..." >&2
       search_paths_array=("." "~")
     fi
-  fi # End of argument parsing for $# > 1
+  fi
 
-  # --- Perform the Search (fd or find) ---
-  local search_command_output
+  # --- Perform the Search (fd or find) with Ignores ---
+  local search_command_output_raw # Raw output before potential grep filtering for find
+  local search_command_output     # Final output for fzf
 
   if [[ -n "$FD_EXECUTABLE" ]]; then
-    # fd handles multiple path arguments robustly.
-    search_command_output=$("$FD_EXECUTABLE" --type f --hidden --follow --exclude .git --exclude node_modules --exclude target "" "${search_paths_array[@]}" 2>/dev/null)
+    echo "fcat: Searching with fd. Applying ignore patterns from $ignore_file if present." >&2
+    search_command_output=$("$FD_EXECUTABLE" --type f --hidden --follow \
+        --exclude .git --exclude node_modules --exclude target \
+        "${ignore_patterns_for_fd[@]}" "" "${search_paths_array[@]}" 2>/dev/null)
   else # Fallback to find
     local find_cmd_args=()
     for path_item in "${search_paths_array[@]}"; do
-      path_item="${path_item/#\~/$HOME}" # Manual tilde expansion for find
+      path_item="${path_item/#\~/$HOME}"
       find_cmd_args+=("$path_item")
     done
-    search_command_output=$(find "${find_cmd_args[@]}" \
+    search_command_output_raw=$(find "${find_cmd_args[@]}" \
       \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path '*/target/*' \) -prune \
       -o -type f -print 2>/dev/null)
+
+    if [[ -f "$ignore_file" ]]; then
+      echo "fcat: Searching with find. Applying ignore patterns from $ignore_file using grep (post-filtering)." >&2
+      search_command_output=$(printf "%s\n" "$search_command_output_raw" | grep -vFf "$ignore_file")
+    else
+      echo "fcat: Searching with find. No ignore file ($ignore_file) found." >&2
+      search_command_output="$search_command_output_raw"
+    fi
   fi
 
-  # Feedback if fd/find yielded no results (before invoking fzf)
   if [[ -z "$search_command_output" && $# -gt 0 && ${#search_paths_array[@]} -gt 0 ]]; then
-      # Only show if args were given and we actually had search paths (not an empty array case).
       local paths_string = "$(printf "%s, " "${search_paths_array[@]}")"
-      echo "fcat: No files found matching search criteria in location(s): ${paths_string%, }." >&2
+      echo "fcat: No files found matching search criteria in location(s): ${paths_string%, } (after ignores)." >&2
   fi
 
   # --- fzf Invocation ---
   local fzf_effective_query="$filename_query"
   local fzf_extra_opts=()
-  local is_broad_fallback=0 # Flag to check if we are searching in "." or "~"
+  local is_broad_fallback=0
 
-  # Determine if it's a broad fallback search to adjust fzf query
   for path_in_search in "${search_paths_array[@]}"; do
     if [[ "$path_in_search" == "." || "$path_in_search" == "$HOME" || "$path_in_search" == "~" ]]; then
       is_broad_fallback=1
@@ -145,23 +161,19 @@ fcat() {
   done
 
   if [[ "$is_broad_fallback" -eq 1 && -n "$dir_hint_string" ]]; then
-    # For broad fallbacks, combine hint and filename for better fzf ranking over full paths
     if [[ -n "$filename_query" ]]; then
       fzf_effective_query="$dir_hint_string $filename_query"
-    else # Only dir_hint was given (e.g., fcat my_project_hint "")
+    else
       fzf_effective_query="$dir_hint_string"
     fi
-    # Trim leading/trailing whitespace from the combined query
     fzf_effective_query="${fzf_effective_query#"${fzf_effective_query%%[![:space:]]*}"}"
     fzf_effective_query="${fzf_effective_query%"${fzf_effective_query##*[![:space:]]}"}"
   elif [[ ${#search_paths_array[@]} -gt 0 && "$is_broad_fallback" -eq 0 ]]; then
-    # For specific resolved directories, focus fzf query on the filename part
     if [[ -n "$filename_query" ]]; then
       fzf_extra_opts+=("--delimiter=/")
-      fzf_extra_opts+=("--nth=-1") # Search primarily in the basename
+      fzf_extra_opts+=("--nth=-1")
     fi
   fi
-  # If fzf_effective_query is empty (e.g., user typed just `fcat`), fzf opens with an empty query field.
 
   selected_file=$(printf "%s\n" "$search_command_output" | \
                   fzf --query="$fzf_effective_query" "${fzf_extra_opts[@]}" \
@@ -170,10 +182,9 @@ fcat() {
   # --- Open Selected File ---
   if [[ -n "$selected_file" ]]; then
     "$OPEN_COMMAND" "$selected_file"
-    ec=$? # Capture exit code of the open command
+    ec=$?
   else
-    # echo "fcat: No file selected or operation cancelled." >&2 # Optional: user feedback
-    ec=1 # Set non-zero exit code for no selection / cancellation
+    ec=1
   fi
   return $ec
 }
